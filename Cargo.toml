@@ -1,0 +1,13 @@
+[package]
+name = "epistle-mp"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "epistle"
+
+[dev-dependencies]
+tempfile = "3"
+
+[dependencies]
+libc = "0.2"
