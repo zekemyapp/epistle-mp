@@ -3,7 +3,6 @@ use std::io::{Error, ErrorKind, Result};
 use std::io::{self, PipeReader, PipeWriter};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::fd::AsRawFd;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use std::thread;
 
@@ -16,13 +15,13 @@ struct LoopOwner {
 	waiting: Option<libc::pthread_t>,
 }
 
-struct LoopFileDescriptor {
+struct LoopFileDescriptor<T>{
 	fd: i32,
 	events: i16,
-	cb: Box<dyn Fn()>,
+	cb: Box<dyn FnMut(&mut T)>,
 }
 
-pub struct Loop {
+pub struct Loop<T> {
 	owner: LoopOwner,
 	check_owner: bool,
 	/* Holds the list of fd to be polled */
@@ -30,23 +29,27 @@ pub struct Loop {
 	/* Used to wakeup the looper from outside */
 	wakeup_pipe_r: PipeReader,
 	wakeup_pipe_w: PipeWriter,
-	/* Holds registered fd */
-	fds: Vec<LoopFileDescriptor>,
+	/* Holds registered fds */
+	reg_fds: Vec<LoopFileDescriptor<T>>,
+}
+
+pub struct Connection {
+    addr: String,
+    reader: Option<BufReader<UnixStream>>,
+    writer: Option<UnixStream>,
+    event_cb: Box<dyn Fn(&Connection, &str)>,
 }
 
 pub struct Server {
-	addr: String,
-	writer: Option<UnixStream>,
-	reader: Mutex<Option<BufReader<UnixStream>>>,
-	pub looper: Loop,
-	event_cb: Option<Box<dyn Fn(u32)>>,
+	pub looper: Loop<Connection>,
+	pub conn: Connection
 }
 
 pub struct Client {
 	writer: Option<UnixStream>,
 }
 
-impl Loop {
+impl<T> Loop<T> {
 	pub fn new() -> Result<Self> {
 		let tid: libc::pthread_t = unsafe { libc::pthread_self() };
 		let (piper, pipew) = io::pipe()?;
@@ -61,12 +64,12 @@ impl Loop {
 			pollfds: Vec::new(),
 			wakeup_pipe_r: piper,
 			wakeup_pipe_w: pipew,
-			fds: Vec::new(),
+			reg_fds: Vec::new(),
 		})
 	}
 
-	pub fn add(&mut self, fd: i32, events: i16, cb: impl Fn() + 'static) {
-		self.fds.push(
+	pub fn add(&mut self, fd: i32, events: i16, cb: impl FnMut(&mut T) + 'static) {
+		self.reg_fds.push(
 			LoopFileDescriptor {
 				fd: fd,
 				events: events,
@@ -75,10 +78,26 @@ impl Loop {
 		)
 	}
 
-	pub fn wait_and_process(&mut self, timeout: i32) -> Result<()> {
+	pub fn wakeup(&mut self) -> Result<()> {
+		self.wakeup_pipe_w.write_all(&[0x1])?;
+		Ok(())
+	}
+
+	pub fn wait_and_process(&mut self, ctx: &mut T, timeout: i32) -> Result<()> {
 		let tid: libc::pthread_t = unsafe { libc::pthread_self() };
 		self.owner.current = tid;
 		self.owner.waiting = Some(tid);
+
+		let ret = self.do_wait_and_process(ctx, timeout);
+
+		self.owner.current = self.owner.creator;
+		/* TODO: clear owner.waiting? */
+
+		return ret;
+	}
+
+	fn do_wait_and_process(&mut self, ctx: &mut T, timeout: i32) -> Result<()> {
+		let mut woke_up:i16 = 0x0;
 
 		/* Do wait and process */
 		self.pollfds.clear();
@@ -91,7 +110,7 @@ impl Loop {
 		});
 
 		/* Push registered fds */
-		for fd in &self.fds {
+		for fd in &self.reg_fds {
 			self.pollfds.push(libc::pollfd {
 				fd: fd.fd,
 				events: fd.events,
@@ -99,85 +118,74 @@ impl Loop {
 			})
 		}
 
-		let ret = unsafe {
-			libc::poll(
+		loop {
+			let ret = unsafe {libc::poll(
 				self.pollfds.as_mut_ptr(),
 				self.pollfds.len() as libc::nfds_t,
 				timeout
-			)
-		};
+			)};
 
-		/* TODO: Handle events */
-		for fd in &self.pollfds {
-			println!("revents {:#x}", fd.revents);
+			if ret < 0 {
+				let os_error = Error::last_os_error();
+				if os_error.kind() == ErrorKind::Interrupted {
+				/* TODO: With a finite timeout, repeated signals
+				 can make the call wait longer than requested.
+				 Track a deadline and pass the remaining time
+				 on each retry. */
+					continue;
+				} else {
+					return Err(os_error);
+				}
+			}
+
+			break;
 		}
 
-		self.owner.current = self.owner.creator;
+		/* TODO: Add watchdog to watch client callbacks */
+		for pfd in &self.pollfds {
+			let revents = pfd.revents;
+			if revents == 0 {continue};
 
-		/* TODO: Handle actual wait and process on a different
-		   method so I can centralize errors from polling and
-		   events */
-		if ret < 0 {
-			/* Read errno */
-			return Err(Error::last_os_error());
+			if pfd.fd == self.wakeup_pipe_r.as_raw_fd() {
+				woke_up = revents;
+				continue;
+			}
+
+			for regfd in &mut self.reg_fds {
+				if regfd.fd == pfd.fd {
+					/* Add revent to callback parameters */
+					(regfd.cb)(ctx);
+				}
+			}
 		}
+		if woke_up != 0 {self.wakeup_cb(woke_up);}
+
 		Ok(())
+	}
+
+	fn wakeup_cb (&mut self, revents:i16) {
+		if revents & libc::POLLIN != 0 {     
+			let mut buf = [0x0; 1];
+			/*TODO: Handle return */
+    			let _ = self.wakeup_pipe_r.read_exact(&mut buf);
+		}
 	}
 }
 
-impl Server {
-	pub fn new(addr: &str) -> Result<Self> {
-		Ok(Self {
-			addr: addr.to_string(),
-			writer: None,
-			reader: None.into(),
-			looper: Loop::new()?,
-			event_cb: None,
-		})
+impl Connection {
+
+	fn server_cb (&mut self) {
+		let mut line = String::new();
+		if self.msg_read(&mut line).is_ok() {
+			(self.event_cb)(self, line.as_str());
+		}
 	}
 
-	pub fn set_event_handler(&mut self, cb: impl Fn(u32) + 'static) {
-		self.event_cb = Some(Box::new(cb));
-	}
-
-	pub fn listen(&mut self) -> Result<()> {
-		println!("listening to {}", self.addr);
-
-		let _ = std::fs::remove_file(&self.addr);
-		/* This could be separated into socket creation and binding
-		   if extra socket configuration is needed.
-		   TODO: keep listener alive in server structure */
-		let listener = Some(UnixListener::bind(&self.addr)?);
-		let (stream, _addr) = listener.as_ref()
-			.expect("listener is None").accept()?;
-
-		self.reader = Some(BufReader::new(stream.try_clone()?)).into();
-		self.writer = Some(stream);
-
-		self.looper.add(
-			self.writer.as_ref()
-				.expect("UnixListener is None")
-				.as_raw_fd(),
-			libc::POLLIN,
-			move || {});
-		Ok(())
-	}
-
-	pub fn msg_read(&self, line: &mut String) -> Result<()> {
-		let mut guard = self.reader.lock().unwrap();
-		let reader = guard.as_mut()
+	pub fn msg_read(&mut self, line: &mut String) -> Result<()> {
+		let reader = self.reader.as_mut()
 			.ok_or_else(|| Error::new(ErrorKind::NotConnected,
 					"Reader is None"))?;
 		reader.read_line(line)?;
-		Ok(())
-	}
-
-	pub fn msg_read_to_end(&self, dump: &mut Vec<u8>) -> Result<()> {
-		let mut guard = self.reader.lock().unwrap();
-		let reader = guard.as_mut()
-			.ok_or_else(|| Error::new(ErrorKind::NotConnected,
-					"Reader is None"))?;
-		reader.read_to_end(dump)?;
 		Ok(())
 	}
 
@@ -186,6 +194,49 @@ impl Server {
 			.write_all(msg.as_bytes())?;
 		Ok(())
 	}
+
+}
+
+impl Server {
+	pub fn new(addr: &str, cb: impl Fn(&Connection, &str) + 'static) -> Result<Self> {
+		Ok(Self {
+			looper: Loop::new()?,
+			conn: Connection { 
+				addr: addr.to_string(),
+				writer: None,
+				reader: None.into(),
+				event_cb: Box::new(cb),
+			},
+		})
+	}
+
+	pub fn listen(&mut self) -> Result<()> {
+		println!("listening to {}", self.conn.addr);
+
+		let _ = std::fs::remove_file(&self.conn.addr);
+		/* This could be separated into socket creation and binding
+		   if extra socket configuration is needed.
+		   TODO: keep listener alive in server structure */
+		let listener = Some(UnixListener::bind(&self.conn.addr)?);
+		let (stream, _addr) = listener.as_ref()
+			.expect("listener is None").accept()?;
+
+		self.conn.reader = Some(BufReader::new(stream.try_clone()?)).into();
+		self.conn.writer = Some(stream); // TODO: change name. This does more than writing
+
+		self.looper.add(
+			self.conn.writer.as_ref()
+				.expect("UnixListener is None")
+				.as_raw_fd(),
+			libc::POLLIN,
+			Connection::server_cb);
+		Ok(())
+	}
+
+	pub fn msg_send(&self, msg: &str) -> Result<()> {
+		self.conn.msg_send(msg)
+	}
+	
 }
 
 impl Client {
